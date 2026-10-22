@@ -1,0 +1,100 @@
+#!/var/jb/bin/sh
+# cloudflared wrapper for jailbroken iOS.
+#
+# Runs the patched binary directly for normal commands. For public quick
+# tunnels it starts the local provisioning shim and points cloudflared at it,
+# working around the upstream empty-body request that Cloudflare rejects.
+set -u
+
+PREFIX="${PREFIX:-/var/jb}"
+DIR="${CLOUDFLARED_IOS_DIR:-$PREFIX/usr/lib/cloudflared-ios}"
+BIN="$DIR/cloudflared"
+
+if [ ! -x "$BIN" ]; then
+  echo "cloudflared: binary not found at $BIN" >&2
+  exit 127
+fi
+
+# Prefer the nodejs package's shim; fall back to the OpenCode runtime.
+NODE="${CLOUDFLARED_IOS_NODE:-}"
+if [ -z "$NODE" ]; then
+  if [ -x "$PREFIX/usr/bin/node" ]; then
+    NODE="$PREFIX/usr/bin/node"
+  elif [ -x "$PREFIX/usr/lib/opencode-ios/node" ]; then
+    NODE="$PREFIX/usr/lib/opencode-ios/node"
+  else
+    NODE="node"
+  fi
+fi
+
+# cgo name resolution avoids the IPv6-only resolver path on iOS.
+if [ -z "${GODEBUG:-}" ]; then
+  GODEBUG="netdns=cgo"
+else
+  case "$GODEBUG" in
+    *netdns=*) : ;;
+    *) GODEBUG="netdns=cgo,$GODEBUG" ;;
+  esac
+fi
+export GODEBUG
+
+# Only quick tunnels need the shim. Named tunnels (--token) and explicit
+# --quick-service invocations go straight to the real binary.
+quick=0
+has_quick_service=0
+has_token=0
+for arg in "$@"; do
+  case "$arg" in
+    --url|--url=*|--hello-world) quick=1 ;;
+    --quick-service|--quick-service=*) has_quick_service=1 ;;
+    --token|--token=*) has_token=1 ;;
+  esac
+done
+
+if [ "$#" -lt 2 ] || [ "$1" != "tunnel" ] || [ "$quick" -ne 1 ] ||
+   [ "$has_quick_service" -ne 0 ] || [ "$has_token" -ne 0 ]; then
+  exec "$BIN" "$@"
+fi
+
+# --- quick tunnel path ------------------------------------------------------
+PORTFILE="${TMPDIR:-/tmp}/cloudflared-ios-port.$$"
+rm -f "$PORTFILE"
+"$NODE" "$DIR/quick-shim.js" "$PORTFILE" >/dev/null 2>&1 &
+SHIM_PID=$!
+
+cleanup() {
+  kill "$SHIM_PID" 2>/dev/null || true
+  wait "$SHIM_PID" 2>/dev/null || true
+  rm -f "$PORTFILE"
+}
+trap cleanup EXIT HUP INT TERM
+
+i=0
+PORT=""
+while [ "$i" -lt 50 ]; do
+  if [ -s "$PORTFILE" ]; then
+    PORT="$(cat "$PORTFILE")"
+    break
+  fi
+  # Shim exited early (port/node problem): fall through to the real binary.
+  kill -0 "$SHIM_PID" 2>/dev/null || break
+  sleep 0.1
+  i=$((i + 1))
+done
+
+if [ -z "$PORT" ]; then
+  echo "cloudflared: quick-tunnel shim failed; trying direct provisioning" >&2
+  "$BIN" "$@"
+  status=$?
+  cleanup
+  trap - EXIT HUP INT TERM
+  exit "$status"
+fi
+
+first="$1"
+shift
+"$BIN" "$first" --quick-service "http://127.0.0.1:$PORT" "$@"
+status=$?
+cleanup
+trap - EXIT HUP INT TERM
+exit "$status"
