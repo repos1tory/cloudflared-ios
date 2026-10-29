@@ -1,9 +1,11 @@
 #!/var/jb/bin/sh
-# cloudflared wrapper for jailbroken iOS.
+# cloudflared wrapper for jailbroken iOS (palera1n rootless and Dopamine).
 #
 # Runs the patched binary directly for normal commands. For public quick
 # tunnels it starts the local provisioning shim and points cloudflared at it,
 # working around the upstream empty-body request that Cloudflare rejects.
+# The normal CLI path never needs Node or npm; Node is only used by the
+# optional quick-tunnel shim.
 set -u
 
 PREFIX="${PREFIX:-/var/jb}"
@@ -15,16 +17,26 @@ if [ ! -x "$BIN" ]; then
   exit 127
 fi
 
-# Prefer the nodejs package's shim; fall back to the OpenCode runtime.
+# Node is optional. Prefer the node-ios shim, then a real binary, then PATH.
+# CLOUDFLARED_IOS_DISABLE_SHIM=1 forces direct provisioning.
 NODE="${CLOUDFLARED_IOS_NODE:-}"
-if [ -z "$NODE" ]; then
-  if [ -x "$PREFIX/usr/bin/node" ]; then
-    NODE="$PREFIX/usr/bin/node"
-  elif [ -x "$PREFIX/usr/lib/opencode-ios/node" ]; then
-    NODE="$PREFIX/usr/lib/opencode-ios/node"
-  else
-    NODE="node"
-  fi
+if [ -z "$NODE" ] && [ -z "${CLOUDFLARED_IOS_DISABLE_SHIM:-}" ]; then
+  for candidate in \
+    "$PREFIX/usr/bin/node" \
+    "$PREFIX/usr/lib/nodejs/node" \
+    "$PREFIX/usr/lib/opencode-ios/node"
+  do
+    if [ -x "$candidate" ]; then
+      NODE="$candidate"
+      break
+    fi
+  done
+fi
+if [ -z "$NODE" ] && [ -z "${CLOUDFLARED_IOS_DISABLE_SHIM:-}" ]; then
+  NODE="$(command -v node 2>/dev/null || true)"
+fi
+if [ -n "$NODE" ] && [ ! -x "$NODE" ]; then
+  NODE=""
 fi
 
 # cgo name resolution avoids the IPv6-only resolver path on iOS.
@@ -52,7 +64,7 @@ for arg in "$@"; do
 done
 
 if [ "$#" -lt 2 ] || [ "$1" != "tunnel" ] || [ "$quick" -ne 1 ] ||
-   [ "$has_quick_service" -ne 0 ] || [ "$has_token" -ne 0 ]; then
+   [ "$has_quick_service" -ne 0 ] || [ "$has_token" -ne 0 ] || [ -z "$NODE" ]; then
   exec "$BIN" "$@"
 fi
 
